@@ -1,0 +1,28 @@
+# 引擎内部（只读）
+engine-docs/
+examples/
+templates/
+urhox-libs/
+schemas/
+prompts/
+lua-tools/
+.emmylua/
+.claude/
+
+# 构建产物和临时文件
+dist/
+.build/
+.tmp/
+.project/
+logs/
+
+# 引擎工具
+.agent/
+.cli/
+
+# meta 文件
+*.meta
+
+# 系统文件
+.DS_Store
+*.swp
