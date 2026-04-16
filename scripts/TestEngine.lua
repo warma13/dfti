@@ -63,21 +63,26 @@ local function Shuffle(t)
 end
 
 --- 深拷贝题目列表（避免修改原始数据）并打乱顺序
+--- 每个题目和选项会附带 originalIndex，用于网络同步时追踪原始编号
 ---@param questions table
 ---@return table shuffled
 local function ShuffleQuestions(questions)
-    -- 浅拷贝题目列表
     local list = {}
     for i, q in ipairs(questions) do
-        -- 拷贝每道题，并打乱选项顺序
+        -- 拷贝每道题的选项，并记录原始索引
         local optionsCopy = {}
-        for _, opt in ipairs(q.options) do
-            table.insert(optionsCopy, opt)
+        for j, opt in ipairs(q.options) do
+            table.insert(optionsCopy, {
+                text = opt.text,
+                scores = opt.scores,
+                originalIndex = j,  -- 原始选项索引（1-based）
+            })
         end
         Shuffle(optionsCopy)
         table.insert(list, {
             text = q.text,
             options = optionsCopy,
+            originalIndex = i,  -- 原始题目索引（1-based）
         })
     end
     -- 打乱题目顺序
