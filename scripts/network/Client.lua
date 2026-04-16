@@ -65,8 +65,7 @@ local COLORS = {
 -- 版本号
 local APP_VERSION = "v1.1.0"
 
--- 管理员用户
-local ADMIN_USER_ID = 1779057459
+-- 管理员用户（从 Settings.ADMIN_UIDS 读取）
 local isAdmin_ = false
 
 -- ============================================================================
@@ -235,52 +234,48 @@ end
 -- 上传题目弹窗
 -- ============================================================================
 
-local function UploadQuestion(questionText, options, onSuccess, onError)
-    local userId = myUserId_ or "anonymous"
+-- 上传回调（服务端响应时调用）
+local uploadQuestionOnSuccess_ = nil
+local uploadQuestionOnError_ = nil
 
-    local data = {
+local function UploadQuestion(questionText, options, onSuccess, onError)
+    local serverConn = network.serverConnection
+    if not serverConn then
+        if onError then onError("未连接到服务器") end
+        return
+    end
+
+    uploadQuestionOnSuccess_ = onSuccess
+    uploadQuestionOnError_ = onError
+
+    local data = VariantMap()
+    data["Data"] = Variant(cjson.encode({
         question = questionText,
         options = options,
-        userId = userId,
-        timestamp = os.time(),
-    }
+    }))
+    serverConn:SendRemoteEvent(EVENTS.UPLOAD_QUESTION, true, data)
+    print("[Client] Sent UploadQuestion to server")
+end
 
-    local jsonStr = cjson.encode(data)
-    local key = "user_question_" .. os.time() .. "_" .. math.random(1000, 9999)
+function HandleUploadQuestionResp(eventType, eventData)
+    local dataJson = eventData["Data"]:GetString()
+    local ok, data = pcall(cjson.decode, dataJson)
+    if not ok or not data then
+        if uploadQuestionOnError_ then uploadQuestionOnError_("响应解析失败") end
+        uploadQuestionOnSuccess_ = nil
+        uploadQuestionOnError_ = nil
+        return
+    end
 
-    clientCloud:Set(key, jsonStr, {
-        ok = function()
-            clientCloud:Get("question_keys", {
-                ok = function(values, iscores)
-                    local keyList = {}
-                    if values.question_keys and type(values.question_keys) == "string" then
-                        local ok2, parsed = pcall(cjson.decode, values.question_keys)
-                        if ok2 and type(parsed) == "table" then
-                            keyList = parsed
-                        end
-                    end
-                    table.insert(keyList, key)
-                    clientCloud:BatchSet()
-                        :Set("question_keys", cjson.encode(keyList))
-                        :Add("question_count", 1)
-                        :Save("更新题目索引", {
-                            ok = function()
-                                if onSuccess then onSuccess() end
-                            end,
-                            error = function(code2, reason2)
-                                if onSuccess then onSuccess() end
-                            end,
-                        })
-                end,
-                error = function(code, reason)
-                    if onSuccess then onSuccess() end
-                end,
-            })
-        end,
-        error = function(code, reason)
-            if onError then onError(reason) end
-        end,
-    })
+    if data.success then
+        print("[Client] UploadQuestion success, count=" .. tostring(data.count))
+        if uploadQuestionOnSuccess_ then uploadQuestionOnSuccess_() end
+    else
+        print("[Client] UploadQuestion failed: " .. tostring(data.reason))
+        if uploadQuestionOnError_ then uploadQuestionOnError_(data.reason or "上传失败") end
+    end
+    uploadQuestionOnSuccess_ = nil
+    uploadQuestionOnError_ = nil
 end
 
 local function OpenViewQuestionsModal()
@@ -319,160 +314,573 @@ local function OpenViewQuestionsModal()
     })
     modal:Open()
 
-    clientCloud:Get("question_keys", {
-        ok = function(values, iscores)
-            contentPanel:ClearChildren()
+    -- 保存引用，供响应回调使用
+    _G._viewQuestionsContent = contentPanel
 
-            local keyList = {}
-            if values.question_keys and type(values.question_keys) == "string" then
-                local ok2, parsed = pcall(cjson.decode, values.question_keys)
-                if ok2 and type(parsed) == "table" then
-                    keyList = parsed
-                end
-            end
+    -- 通过远程事件向服务端请求题目列表
+    local serverConn = network.serverConnection
+    if serverConn then
+        serverConn:SendRemoteEvent(EVENTS.REQUEST_USER_QUESTIONS, true, VariantMap())
+        print("[Client] Requested user questions from server")
+    else
+        contentPanel:ClearChildren()
+        contentPanel:AddChild(UI.Label {
+            text = "未连接到服务器",
+            fontSize = 13,
+            fontColor = { 239, 68, 68, 255 },
+            textAlign = "center",
+            width = "100%",
+        })
+    end
+end
 
-            if #keyList == 0 then
-                contentPanel:AddChild(UI.Panel {
+function HandleUserQuestionsResp(eventType, eventData)
+    local contentPanel = _G._viewQuestionsContent
+    if not contentPanel then return end
+
+    local dataJson = eventData["Data"]:GetString()
+    local ok, data = pcall(cjson.decode, dataJson)
+    if not ok or not data then
+        contentPanel:ClearChildren()
+        contentPanel:AddChild(UI.Label {
+            text = "数据解析失败",
+            fontSize = 13,
+            fontColor = { 239, 68, 68, 255 },
+            textAlign = "center",
+            width = "100%",
+        })
+        return
+    end
+
+    local questions = data.questions or {}
+    contentPanel:ClearChildren()
+
+    if #questions == 0 then
+        contentPanel:AddChild(UI.Panel {
+            width = "100%",
+            height = 120,
+            justifyContent = "center",
+            alignItems = "center",
+            children = {
+                UI.Label {
+                    text = "暂无上传的题目",
+                    fontSize = 14,
+                    fontColor = { 255, 255, 255, 100 },
+                },
+            }
+        })
+        return
+    end
+
+    contentPanel:AddChild(UI.Label {
+        text = "共 " .. #questions .. " 道题目",
+        fontSize = 12,
+        fontColor = { 255, 255, 255, 100 },
+        textAlign = "center",
+        width = "100%",
+    })
+
+    -- 倒序显示（最新在前）
+    for i = #questions, 1, -1 do
+        local qData = questions[i]
+        local optWidgets = {}
+        for oi, opt in ipairs(qData.options or {}) do
+            table.insert(optWidgets, UI.Panel {
+                flexDirection = "row",
+                alignItems = "center",
+                gap = 8,
+                children = {
+                    UI.Panel {
+                        width = 22, height = 22,
+                        borderRadius = 11,
+                        backgroundColor = { 220, 170, 60, 40 },
+                        justifyContent = "center",
+                        alignItems = "center",
+                        children = {
+                            UI.Label {
+                                text = string.char(64 + oi),
+                                fontSize = 10,
+                                fontColor = { 220, 170, 60, 200 },
+                            }
+                        }
+                    },
+                    UI.Label {
+                        text = opt,
+                        fontSize = 13,
+                        fontColor = { 255, 255, 255, 180 },
+                        flexShrink = 1,
+                        whiteSpace = "normal",
+                    },
+                }
+            })
+        end
+
+        local timeStr = ""
+        if qData.timestamp then
+            timeStr = os.date("%Y-%m-%d %H:%M", qData.timestamp)
+        end
+
+        contentPanel:AddChild(UI.Panel {
+            width = "100%",
+            padding = 14,
+            backgroundColor = { 35, 35, 65, 200 },
+            borderRadius = 12,
+            borderWidth = 1,
+            borderColor = { 60, 60, 100, 80 },
+            gap = 10,
+            children = {
+                UI.Label {
+                    text = qData.question or "(无题目)",
+                    fontSize = 15,
+                    fontColor = { 255, 255, 255, 240 },
+                    whiteSpace = "normal",
+                    lineHeight = 1.4,
                     width = "100%",
-                    height = 120,
-                    justifyContent = "center",
-                    alignItems = "center",
+                },
+                UI.Panel {
+                    width = "100%",
+                    gap = 6,
+                    paddingLeft = 4,
+                    children = optWidgets,
+                },
+                UI.Panel {
+                    width = "100%",
+                    flexDirection = "row",
+                    justifyContent = "space-between",
                     children = {
                         UI.Label {
-                            text = "暂无上传的题目",
-                            fontSize = 14,
-                            fontColor = { 255, 255, 255, 100 },
+                            text = timeStr,
+                            fontSize = 11,
+                            fontColor = { 255, 255, 255, 60 },
+                        },
+                        UI.Label {
+                            text = "#" .. (#questions - i + 1),
+                            fontSize = 11,
+                            fontColor = { 255, 255, 255, 60 },
                         },
                     }
-                })
-                return
+                },
+            }
+        })
+    end
+end
+
+-- ============================================================================
+-- 反馈响应处理
+-- ============================================================================
+
+function HandleSubmitFeedbackResp(eventType, eventData)
+    local statusLabel = _G._feedbackStatusLabel
+    local modal = _G._feedbackModal
+    if not statusLabel then return end
+
+    local dataJson = eventData["Data"]:GetString()
+    local ok, data = pcall(cjson.decode, dataJson)
+    if not ok or not data then
+        statusLabel:SetStyle({
+            text = "响应解析失败",
+            fontColor = { 239, 68, 68, 255 },
+            height = 20,
+        })
+        return
+    end
+
+    if data.success then
+        statusLabel:SetStyle({
+            text = "感谢你的反馈！",
+            fontColor = { 34, 197, 94, 255 },
+            height = 20,
+        })
+        local closeTimer = 0
+        SubscribeToEvent("Update", function(_, ed)
+            closeTimer = closeTimer + ed["TimeStep"]:GetFloat()
+            if closeTimer >= 1.5 then
+                UnsubscribeFromEvent("Update")
+                if modal then modal:Close() end
             end
+        end)
+    else
+        statusLabel:SetStyle({
+            text = "提交失败: " .. tostring(data.reason or "未知错误"),
+            fontColor = { 239, 68, 68, 255 },
+            height = 20,
+        })
+    end
 
-            contentPanel:AddChild(UI.Label {
-                text = "共 " .. #keyList .. " 道题目",
-                fontSize = 12,
-                fontColor = { 255, 255, 255, 100 },
-                textAlign = "center",
-                width = "100%",
-            })
+    _G._feedbackStatusLabel = nil
+    _G._feedbackModal = nil
+end
 
-            local batch = clientCloud:BatchGet()
-            for _, k in ipairs(keyList) do
-                batch:Key(k)
-            end
-            batch:Fetch({
-                ok = function(vals, iscrs)
-                    for i = #keyList, 1, -1 do
-                        local k = keyList[i]
-                        local raw = vals[k]
-                        if raw then
-                            local qOk, qData = pcall(cjson.decode, raw)
-                            if qOk and type(qData) == "table" then
-                                local optWidgets = {}
-                                for oi, opt in ipairs(qData.options or {}) do
-                                    table.insert(optWidgets, UI.Panel {
-                                        flexDirection = "row",
-                                        alignItems = "center",
-                                        gap = 8,
-                                        children = {
-                                            UI.Panel {
-                                                width = 22, height = 22,
-                                                borderRadius = 11,
-                                                backgroundColor = { 220, 170, 60, 40 },
-                                                justifyContent = "center",
-                                                alignItems = "center",
-                                                children = {
-                                                    UI.Label {
-                                                        text = string.char(64 + oi),
-                                                        fontSize = 10,
-                                                        fontColor = { 220, 170, 60, 200 },
-                                                    }
-                                                }
-                                            },
-                                            UI.Label {
-                                                text = opt,
-                                                fontSize = 13,
-                                                fontColor = { 255, 255, 255, 180 },
-                                                flexShrink = 1,
-                                                whiteSpace = "normal",
-                                            },
-                                        }
-                                    })
-                                end
+-- ============================================================================
+-- 管理员：查看所有反馈
+-- ============================================================================
 
-                                local timeStr = ""
-                                if qData.timestamp then
-                                    timeStr = os.date("%Y-%m-%d %H:%M", qData.timestamp)
-                                end
+local function OpenAllFeedbacksModal()
+    local modal = UI.Modal {
+        title = "全部用户反馈",
+        size = "lg",
+        closeOnOverlay = true,
+        closeOnEscape = true,
+        showCloseButton = true,
+        backgroundColor = { 20, 20, 45, 250 },
+        borderColor = { 60, 60, 100, 120 },
+        borderWidth = 1,
+        borderRadius = 16,
+        onClose = function(self) self:Close() end,
+    }
 
-                                contentPanel:AddChild(UI.Panel {
-                                    width = "100%",
-                                    padding = 14,
-                                    backgroundColor = { 35, 35, 65, 200 },
-                                    borderRadius = 12,
-                                    borderWidth = 1,
-                                    borderColor = { 60, 60, 100, 80 },
-                                    gap = 10,
-                                    children = {
-                                        UI.Label {
-                                            text = qData.question or "(无题目)",
-                                            fontSize = 15,
-                                            fontColor = { 255, 255, 255, 240 },
-                                            whiteSpace = "normal",
-                                            lineHeight = 1.4,
-                                            width = "100%",
-                                        },
-                                        UI.Panel {
-                                            width = "100%",
-                                            gap = 6,
-                                            paddingLeft = 4,
-                                            children = optWidgets,
-                                        },
-                                        UI.Panel {
-                                            width = "100%",
-                                            flexDirection = "row",
-                                            justifyContent = "space-between",
-                                            children = {
-                                                UI.Label {
-                                                    text = timeStr,
-                                                    fontSize = 11,
-                                                    fontColor = { 255, 255, 255, 60 },
-                                                },
-                                                UI.Label {
-                                                    text = "#" .. (#keyList - i + 1),
-                                                    fontSize = 11,
-                                                    fontColor = { 255, 255, 255, 60 },
-                                                },
-                                            }
-                                        },
-                                    }
-                                })
-                            end
-                        end
-                    end
-                end,
-                error = function(code, reason)
-                    contentPanel:AddChild(UI.Label {
-                        text = "加载题目详情失败: " .. tostring(reason),
-                        fontSize = 13,
-                        fontColor = { 239, 68, 68, 255 },
-                        textAlign = "center",
-                        width = "100%",
-                    })
-                end,
-            })
-        end,
-        error = function(code, reason)
-            contentPanel:ClearChildren()
-            contentPanel:AddChild(UI.Label {
-                text = "加载失败: " .. tostring(reason),
-                fontSize = 13,
-                fontColor = { 239, 68, 68, 255 },
-                textAlign = "center",
-                width = "100%",
-            })
-        end,
+    local contentPanel = UI.Panel {
+        width = "100%",
+        gap = 12,
+        padding = 4,
+    }
+
+    contentPanel:AddChild(UI.Label {
+        text = "加载中...",
+        fontSize = 14,
+        fontColor = { 220, 170, 60, 200 },
+        textAlign = "center",
+        width = "100%",
     })
+
+    modal:AddContent(UI.ScrollView {
+        width = "100%",
+        flexGrow = 1,
+        flexShrink = 1,
+        children = { contentPanel },
+    })
+    modal:Open()
+
+    _G._allFeedbacksContent = contentPanel
+
+    local serverConn = network.serverConnection
+    if serverConn then
+        serverConn:SendRemoteEvent(EVENTS.REQUEST_ALL_FEEDBACKS, true, VariantMap())
+        print("[Client] Requested all feedbacks from server (admin)")
+    else
+        contentPanel:ClearChildren()
+        contentPanel:AddChild(UI.Label {
+            text = "未连接到服务器",
+            fontSize = 13,
+            fontColor = { 239, 68, 68, 255 },
+            textAlign = "center",
+            width = "100%",
+        })
+    end
+end
+
+function HandleAllFeedbacksResp(eventType, eventData)
+    local contentPanel = _G._allFeedbacksContent
+    if not contentPanel then return end
+
+    local dataJson = eventData["Data"]:GetString()
+    local ok, data = pcall(cjson.decode, dataJson)
+    if not ok or not data then
+        contentPanel:ClearChildren()
+        contentPanel:AddChild(UI.Label {
+            text = "数据解析失败",
+            fontSize = 13,
+            fontColor = { 239, 68, 68, 255 },
+            textAlign = "center",
+            width = "100%",
+        })
+        return
+    end
+
+    if data.denied then
+        contentPanel:ClearChildren()
+        contentPanel:AddChild(UI.Label {
+            text = "无权限查看",
+            fontSize = 13,
+            fontColor = { 239, 68, 68, 255 },
+            textAlign = "center",
+            width = "100%",
+        })
+        return
+    end
+
+    local feedbacks = data.feedbacks or {}
+    contentPanel:ClearChildren()
+
+    if #feedbacks == 0 then
+        contentPanel:AddChild(UI.Panel {
+            width = "100%",
+            height = 120,
+            justifyContent = "center",
+            alignItems = "center",
+            children = {
+                UI.Label {
+                    text = "暂无任何用户反馈",
+                    fontSize = 14,
+                    fontColor = { 255, 255, 255, 100 },
+                },
+            }
+        })
+        return
+    end
+
+    contentPanel:AddChild(UI.Label {
+        text = "共 " .. #feedbacks .. " 条反馈",
+        fontSize = 12,
+        fontColor = { 255, 255, 255, 100 },
+        textAlign = "center",
+        width = "100%",
+    })
+
+    -- 倒序显示（最新在前）
+    for i = #feedbacks, 1, -1 do
+        local fb = feedbacks[i]
+        local timeStr = ""
+        if fb.timestamp then
+            timeStr = os.date("%Y-%m-%d %H:%M", fb.timestamp)
+        end
+        local userIdStr = fb.userId and ("用户: " .. tostring(fb.userId)) or ""
+
+        contentPanel:AddChild(UI.Panel {
+            width = "100%",
+            padding = 14,
+            backgroundColor = { 35, 35, 65, 200 },
+            borderRadius = 12,
+            borderWidth = 1,
+            borderColor = { 60, 60, 100, 80 },
+            gap = 8,
+            children = {
+                UI.Label {
+                    text = fb.feedback or "",
+                    fontSize = 14,
+                    fontColor = { 255, 255, 255, 220 },
+                    whiteSpace = "normal",
+                    lineHeight = 1.4,
+                    width = "100%",
+                },
+                UI.Panel {
+                    width = "100%",
+                    flexDirection = "row",
+                    justifyContent = "space-between",
+                    children = {
+                        UI.Label {
+                            text = userIdStr,
+                            fontSize = 11,
+                            fontColor = { 100, 180, 255, 120 },
+                        },
+                        UI.Label {
+                            text = timeStr,
+                            fontSize = 11,
+                            fontColor = { 255, 255, 255, 60 },
+                        },
+                    }
+                },
+            }
+        })
+    end
+end
+
+-- ============================================================================
+-- 管理员：查看所有用户上传的题目
+-- ============================================================================
+
+local function OpenAllQuestionsModal()
+    local modal = UI.Modal {
+        title = "全部用户题目",
+        size = "lg",
+        closeOnOverlay = true,
+        closeOnEscape = true,
+        showCloseButton = true,
+        backgroundColor = { 20, 20, 45, 250 },
+        borderColor = { 60, 60, 100, 120 },
+        borderWidth = 1,
+        borderRadius = 16,
+        onClose = function(self) self:Close() end,
+    }
+
+    local contentPanel = UI.Panel {
+        width = "100%",
+        gap = 12,
+        padding = 4,
+    }
+
+    contentPanel:AddChild(UI.Label {
+        text = "加载中...",
+        fontSize = 14,
+        fontColor = { 220, 170, 60, 200 },
+        textAlign = "center",
+        width = "100%",
+    })
+
+    modal:AddContent(UI.ScrollView {
+        width = "100%",
+        flexGrow = 1,
+        flexShrink = 1,
+        children = { contentPanel },
+    })
+    modal:Open()
+
+    _G._allQuestionsContent = contentPanel
+
+    local serverConn = network.serverConnection
+    if serverConn then
+        serverConn:SendRemoteEvent(EVENTS.REQUEST_ALL_QUESTIONS, true, VariantMap())
+        print("[Client] Requested all questions from server (admin)")
+    else
+        contentPanel:ClearChildren()
+        contentPanel:AddChild(UI.Label {
+            text = "未连接到服务器",
+            fontSize = 13,
+            fontColor = { 239, 68, 68, 255 },
+            textAlign = "center",
+            width = "100%",
+        })
+    end
+end
+
+function HandleAllQuestionsResp(eventType, eventData)
+    local contentPanel = _G._allQuestionsContent
+    if not contentPanel then return end
+
+    local dataJson = eventData["Data"]:GetString()
+    local ok, data = pcall(cjson.decode, dataJson)
+    if not ok or not data then
+        contentPanel:ClearChildren()
+        contentPanel:AddChild(UI.Label {
+            text = "数据解析失败",
+            fontSize = 13,
+            fontColor = { 239, 68, 68, 255 },
+            textAlign = "center",
+            width = "100%",
+        })
+        return
+    end
+
+    if data.denied then
+        contentPanel:ClearChildren()
+        contentPanel:AddChild(UI.Label {
+            text = "无权限查看",
+            fontSize = 13,
+            fontColor = { 239, 68, 68, 255 },
+            textAlign = "center",
+            width = "100%",
+        })
+        return
+    end
+
+    local questions = data.questions or {}
+    contentPanel:ClearChildren()
+
+    if #questions == 0 then
+        contentPanel:AddChild(UI.Panel {
+            width = "100%",
+            height = 120,
+            justifyContent = "center",
+            alignItems = "center",
+            children = {
+                UI.Label {
+                    text = "暂无任何用户上传的题目",
+                    fontSize = 14,
+                    fontColor = { 255, 255, 255, 100 },
+                },
+            }
+        })
+        return
+    end
+
+    contentPanel:AddChild(UI.Label {
+        text = "共 " .. #questions .. " 道题目（所有用户）",
+        fontSize = 12,
+        fontColor = { 255, 255, 255, 100 },
+        textAlign = "center",
+        width = "100%",
+    })
+
+    -- 倒序显示（最新在前）
+    for i = #questions, 1, -1 do
+        local qData = questions[i]
+        local optWidgets = {}
+        for oi, opt in ipairs(qData.options or {}) do
+            table.insert(optWidgets, UI.Panel {
+                flexDirection = "row",
+                alignItems = "center",
+                gap = 8,
+                children = {
+                    UI.Panel {
+                        width = 22, height = 22,
+                        borderRadius = 11,
+                        backgroundColor = { 220, 170, 60, 40 },
+                        justifyContent = "center",
+                        alignItems = "center",
+                        children = {
+                            UI.Label {
+                                text = string.char(64 + oi),
+                                fontSize = 10,
+                                fontColor = { 220, 170, 60, 200 },
+                            }
+                        }
+                    },
+                    UI.Label {
+                        text = opt,
+                        fontSize = 13,
+                        fontColor = { 255, 255, 255, 180 },
+                        flexShrink = 1,
+                        whiteSpace = "normal",
+                    },
+                }
+            })
+        end
+
+        local timeStr = ""
+        if qData.timestamp then
+            timeStr = os.date("%Y-%m-%d %H:%M", qData.timestamp)
+        end
+
+        local userIdStr = qData.userId and ("用户: " .. tostring(qData.userId)) or ""
+
+        contentPanel:AddChild(UI.Panel {
+            width = "100%",
+            padding = 14,
+            backgroundColor = { 35, 35, 65, 200 },
+            borderRadius = 12,
+            borderWidth = 1,
+            borderColor = { 60, 60, 100, 80 },
+            gap = 10,
+            children = {
+                UI.Label {
+                    text = qData.question or "(无题目)",
+                    fontSize = 15,
+                    fontColor = { 255, 255, 255, 240 },
+                    whiteSpace = "normal",
+                    lineHeight = 1.4,
+                    width = "100%",
+                },
+                UI.Panel {
+                    width = "100%",
+                    gap = 6,
+                    paddingLeft = 4,
+                    children = optWidgets,
+                },
+                UI.Panel {
+                    width = "100%",
+                    flexDirection = "row",
+                    justifyContent = "space-between",
+                    children = {
+                        UI.Label {
+                            text = userIdStr,
+                            fontSize = 11,
+                            fontColor = { 100, 180, 255, 120 },
+                        },
+                        UI.Label {
+                            text = timeStr,
+                            fontSize = 11,
+                            fontColor = { 255, 255, 255, 60 },
+                        },
+                        UI.Label {
+                            text = "#" .. (#questions - i + 1),
+                            fontSize = 11,
+                            fontColor = { 255, 255, 255, 60 },
+                        },
+                    }
+                },
+            }
+        })
+    end
 end
 
 -- ============================================================================
@@ -490,7 +898,7 @@ local TYPE_INFO = {
     ATRS = { animal = "奉献的鹤", color = { 34, 197, 94, 255 }, operator = "蜂医 / 蝶",
         description = "你是那个队友血量永远满的原因。进攻的时候你不抢人头，但你的烟雾弹永远扔在最关键的位置。你把「打辅助」变成了一门艺术。",
         traits = { "进攻奶妈", "烟雾大师", "无私续航", "幕后英雄" } },
-    ATRI = { animal = "热血的野猪", color = { 251, 146, 60, 255 }, operator = "乌鲁鲁 / 蜂医",
+    ATRI = { animal = "热血的金毛", color = { 251, 146, 60, 255 }, operator = "乌鲁鲁 / 蜂医",
         description = "你是队伍里啥都干的那个人——需要冲锋你冲锋，需要拉人你拉人。你凭直觉判断队伍现在最缺什么，然后立刻去补。",
         traits = { "万金油", "热心过头", "义气冲天", "有你真好" } },
     ALCS = { animal = "孤傲的豹", color = { 107, 114, 128, 255 }, operator = "骇爪 / 无名",
@@ -599,20 +1007,25 @@ local function OpenLeaderboardModal()
 
     local modal = UI.Modal {
         title = "人格榜",
-        width = "92%",
-        maxWidth = 420,
-        maxHeight = "85%",
+        size = "md",
+        closeOnOverlay = true,
+        closeOnEscape = true,
+        showCloseButton = true,
         backgroundColor = { 18, 18, 40, 245 },
         borderRadius = 16,
-        onClose = function() _G._leaderboardModal = nil end,
+        onClose = function(self)
+            _G._leaderboardModal = nil
+            _G._leaderboardContent = nil
+            self:Close()
+        end,
     }
     modal:AddContent(UI.ScrollView {
         width = "100%",
         flexGrow = 1,
-        flexBasis = 0,
+        flexShrink = 1,
         children = { contentPanel },
     })
-    modal:Show()
+    modal:Open()
 
     _G._leaderboardModal = modal
     _G._leaderboardContent = contentPanel
@@ -1051,39 +1464,24 @@ local function OpenFeedbackModal()
                 height = 20,
             })
 
-            local data = {
-                feedback = feedbackText,
-                userId = myUserId_ or "anonymous",
-                timestamp = os.time(),
-            }
+            local serverConn = network.serverConnection
+            if not serverConn then
+                statusLabel:SetStyle({
+                    text = "未连接到服务器",
+                    fontColor = { 239, 68, 68, 255 },
+                    height = 20,
+                })
+                return
+            end
 
-            local jsonStr = cjson.encode(data)
-            local key = "user_feedback_" .. os.time() .. "_" .. math.random(1000, 9999)
+            -- 保存回调引用供响应时使用
+            _G._feedbackStatusLabel = statusLabel
+            _G._feedbackModal = modal
 
-            clientCloud:Set(key, jsonStr, {
-                ok = function()
-                    statusLabel:SetStyle({
-                        text = "感谢你的反馈！",
-                        fontColor = { 34, 197, 94, 255 },
-                        height = 20,
-                    })
-                    local closeTimer = 0
-                    SubscribeToEvent("Update", function(_, ed)
-                        closeTimer = closeTimer + ed["TimeStep"]:GetFloat()
-                        if closeTimer >= 1.5 then
-                            UnsubscribeFromEvent("Update")
-                            if modal then modal:Close() end
-                        end
-                    end)
-                end,
-                fail = function(reason)
-                    statusLabel:SetStyle({
-                        text = "提交失败: " .. tostring(reason),
-                        fontColor = { 239, 68, 68, 255 },
-                        height = 20,
-                    })
-                end,
-            })
+            local evData = VariantMap()
+            evData["Data"] = Variant(cjson.encode({ feedback = feedbackText }))
+            serverConn:SendRemoteEvent(EVENTS.SUBMIT_FEEDBACK, true, evData)
+            print("[Client] Sent feedback to server")
         end,
         children = {
             UI.Label {
@@ -1484,6 +1882,155 @@ local function BuildSoundToggle()
     }
 end
 
+--- 构建首页底部按钮行（管理员会多一个"查看全部题目"按钮）
+local function BuildBottomButtonRow()
+    local buttons = {}
+
+    -- 管理员按钮
+    if isAdmin_ then
+        -- 查看全部题目
+        table.insert(buttons, UI.Panel {
+            paddingHorizontal = 20,
+            paddingVertical = 10,
+            borderRadius = 20,
+            backgroundColor = { 30, 30, 55, 200 },
+            borderWidth = 1,
+            borderColor = { 255, 100, 100, 80 },
+            flexDirection = "row",
+            alignItems = "center",
+            justifyContent = "center",
+            gap = 6,
+            transition = "backgroundColor 0.15s easeOut, scale 0.15s easeOut, borderColor 0.15s easeOut",
+            onPointerEnter = function(event, widget)
+                widget:SetStyle({ backgroundColor = { 50, 30, 30, 230 }, scale = 1.05, borderColor = { 255, 100, 100, 180 } })
+            end,
+            onPointerLeave = function(event, widget)
+                widget:SetStyle({ backgroundColor = { 30, 30, 55, 200 }, scale = 1.0, borderColor = { 255, 100, 100, 80 } })
+            end,
+            onClick = function(self)
+                PlayClick()
+                OpenAllQuestionsModal()
+            end,
+            children = {
+                UI.Label {
+                    text = "全部题目",
+                    fontSize = 13,
+                    fontColor = { 255, 100, 100, 220 },
+                },
+            },
+        })
+        -- 查看全部反馈
+        table.insert(buttons, UI.Panel {
+            paddingHorizontal = 20,
+            paddingVertical = 10,
+            borderRadius = 20,
+            backgroundColor = { 30, 30, 55, 200 },
+            borderWidth = 1,
+            borderColor = { 255, 100, 100, 80 },
+            flexDirection = "row",
+            alignItems = "center",
+            justifyContent = "center",
+            gap = 6,
+            transition = "backgroundColor 0.15s easeOut, scale 0.15s easeOut, borderColor 0.15s easeOut",
+            onPointerEnter = function(event, widget)
+                widget:SetStyle({ backgroundColor = { 50, 30, 30, 230 }, scale = 1.05, borderColor = { 255, 100, 100, 180 } })
+            end,
+            onPointerLeave = function(event, widget)
+                widget:SetStyle({ backgroundColor = { 30, 30, 55, 200 }, scale = 1.0, borderColor = { 255, 100, 100, 80 } })
+            end,
+            onClick = function(self)
+                PlayClick()
+                OpenAllFeedbacksModal()
+            end,
+            children = {
+                UI.Label {
+                    text = "全部反馈",
+                    fontSize = 13,
+                    fontColor = { 255, 100, 100, 220 },
+                },
+            },
+        })
+    end
+
+    -- 上传题目按钮
+    table.insert(buttons, UI.Panel {
+        paddingHorizontal = 20,
+        paddingVertical = 10,
+        borderRadius = 20,
+        backgroundColor = { 30, 30, 55, 200 },
+        borderWidth = 1,
+        borderColor = { 220, 170, 60, 80 },
+        flexDirection = "row",
+        alignItems = "center",
+        justifyContent = "center",
+        gap = 6,
+        transition = "backgroundColor 0.15s easeOut, scale 0.15s easeOut, borderColor 0.15s easeOut",
+        onPointerEnter = function(event, widget)
+            widget:SetStyle({ backgroundColor = { 40, 40, 65, 230 }, scale = 1.05, borderColor = { 220, 170, 60, 150 } })
+        end,
+        onPointerLeave = function(event, widget)
+            widget:SetStyle({ backgroundColor = { 30, 30, 55, 200 }, scale = 1.0, borderColor = { 220, 170, 60, 80 } })
+        end,
+        onClick = function(self)
+            PlayClick()
+            OpenUploadModal()
+        end,
+        children = {
+            UI.Label {
+                text = "+",
+                fontSize = 16,
+                fontColor = { 220, 170, 60, 220 },
+            },
+            UI.Label {
+                text = "上传题目",
+                fontSize = 13,
+                fontColor = { 220, 170, 60, 220 },
+            },
+        },
+    })
+
+    -- 反馈与建议按钮
+    table.insert(buttons, UI.Panel {
+        paddingHorizontal = 20,
+        paddingVertical = 10,
+        borderRadius = 20,
+        backgroundColor = { 30, 30, 55, 200 },
+        borderWidth = 1,
+        borderColor = { 100, 120, 220, 80 },
+        flexDirection = "row",
+        alignItems = "center",
+        justifyContent = "center",
+        gap = 6,
+        transition = "backgroundColor 0.15s easeOut, scale 0.15s easeOut, borderColor 0.15s easeOut",
+        onPointerEnter = function(event, widget)
+            widget:SetStyle({ backgroundColor = { 40, 40, 65, 230 }, scale = 1.05, borderColor = { 100, 120, 220, 150 } })
+        end,
+        onPointerLeave = function(event, widget)
+            widget:SetStyle({ backgroundColor = { 30, 30, 55, 200 }, scale = 1.0, borderColor = { 100, 120, 220, 80 } })
+        end,
+        onClick = function(self)
+            PlayClick()
+            OpenFeedbackModal()
+        end,
+        children = {
+            UI.Label {
+                text = "反馈与建议",
+                fontSize = 13,
+                fontColor = { 140, 160, 240, 220 },
+            },
+        },
+    })
+
+    return UI.Panel {
+        marginTop = 24,
+        flexDirection = "row",
+        gap = 12,
+        justifyContent = "center",
+        flexWrap = "wrap",
+        children = buttons,
+    }
+end
+
 function BuildHomePage()
     local quiz = quizRegistry_[1]
 
@@ -1653,79 +2200,7 @@ function BuildHomePage()
                             },
                         },
                     },
-                    UI.Panel {
-                        marginTop = 24,
-                        flexDirection = "row",
-                        gap = 12,
-                        justifyContent = "center",
-                        children = {
-                            UI.Panel {
-                                paddingHorizontal = 20,
-                                paddingVertical = 10,
-                                borderRadius = 20,
-                                backgroundColor = { 30, 30, 55, 200 },
-                                borderWidth = 1,
-                                borderColor = { 220, 170, 60, 80 },
-                                flexDirection = "row",
-                                alignItems = "center",
-                                justifyContent = "center",
-                                gap = 6,
-                                transition = "backgroundColor 0.15s easeOut, scale 0.15s easeOut, borderColor 0.15s easeOut",
-                                onPointerEnter = function(event, widget)
-                                    widget:SetStyle({ backgroundColor = { 40, 40, 65, 230 }, scale = 1.05, borderColor = { 220, 170, 60, 150 } })
-                                end,
-                                onPointerLeave = function(event, widget)
-                                    widget:SetStyle({ backgroundColor = { 30, 30, 55, 200 }, scale = 1.0, borderColor = { 220, 170, 60, 80 } })
-                                end,
-                                onClick = function(self)
-                                    PlayClick()
-                                    OpenUploadModal()
-                                end,
-                                children = {
-                                    UI.Label {
-                                        text = "+",
-                                        fontSize = 16,
-                                        fontColor = { 220, 170, 60, 220 },
-                                    },
-                                    UI.Label {
-                                        text = "上传题目",
-                                        fontSize = 13,
-                                        fontColor = { 220, 170, 60, 220 },
-                                    },
-                                },
-                            },
-                            UI.Panel {
-                                paddingHorizontal = 20,
-                                paddingVertical = 10,
-                                borderRadius = 20,
-                                backgroundColor = { 30, 30, 55, 200 },
-                                borderWidth = 1,
-                                borderColor = { 100, 120, 220, 80 },
-                                flexDirection = "row",
-                                alignItems = "center",
-                                justifyContent = "center",
-                                gap = 6,
-                                transition = "backgroundColor 0.15s easeOut, scale 0.15s easeOut, borderColor 0.15s easeOut",
-                                onPointerEnter = function(event, widget)
-                                    widget:SetStyle({ backgroundColor = { 40, 40, 65, 230 }, scale = 1.05, borderColor = { 100, 120, 220, 150 } })
-                                end,
-                                onPointerLeave = function(event, widget)
-                                    widget:SetStyle({ backgroundColor = { 30, 30, 55, 200 }, scale = 1.0, borderColor = { 100, 120, 220, 80 } })
-                                end,
-                                onClick = function(self)
-                                    PlayClick()
-                                    OpenFeedbackModal()
-                                end,
-                                children = {
-                                    UI.Label {
-                                        text = "反馈与建议",
-                                        fontSize = 13,
-                                        fontColor = { 140, 160, 240, 220 },
-                                    },
-                                },
-                            },
-                        },
-                    },
+                    BuildBottomButtonRow(),
                 },
             },
             BuildSoundToggle(),
@@ -2739,8 +3214,13 @@ function HandleClientInfo(eventType, eventData)
     end)
     if ok and uid then
         myUserId_ = uid
-        isAdmin_ = (tonumber(uid) == ADMIN_USER_ID)
+        isAdmin_ = Settings.ADMIN_UIDS[tonumber(uid)] == true
         print("[Client] My userId=" .. myUserId_ .. " isAdmin=" .. tostring(isAdmin_))
+
+        -- 管理员身份确认后刷新首页（重新构建按钮行，显示管理员按钮）
+        if isAdmin_ and currentPage_ == "home" then
+            NavigateTo("home")
+        end
     else
         print("[Client] HandleClientInfo error: " .. tostring(uid))
     end
@@ -2881,6 +3361,11 @@ function Client.Start()
     SubscribeToEvent(EVENTS.RESULT_STATS_RESP, "HandleResultStatsResp")
     SubscribeToEvent(EVENTS.HISTORY_RESP, "HandleHistoryResp")
     SubscribeToEvent(EVENTS.ALL_RESULTS_RESP, "HandleAllResultsResp")
+    SubscribeToEvent(EVENTS.UPLOAD_QUESTION_RESP, "HandleUploadQuestionResp")
+    SubscribeToEvent(EVENTS.USER_QUESTIONS_RESP, "HandleUserQuestionsResp")
+    SubscribeToEvent(EVENTS.ALL_QUESTIONS_RESP, "HandleAllQuestionsResp")
+    SubscribeToEvent(EVENTS.SUBMIT_FEEDBACK_RESP, "HandleSubmitFeedbackResp")
+    SubscribeToEvent(EVENTS.ALL_FEEDBACKS_RESP, "HandleAllFeedbacksResp")
     SubscribeToEvent("ServerConnected", "HandleServerConnected")
 
     -- 如果已经连接到服务器，立即发送 ClientReady
@@ -2929,8 +3414,6 @@ function HandleKeyDown(eventType, eventData)
             currentSession_ = nil
             NavigateTo("home")
         end
-    elseif key == KEY_F8 and isAdmin_ then
-        OpenViewQuestionsModal()
     end
 end
 

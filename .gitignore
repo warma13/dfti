@@ -1,17 +1,2 @@
 .build/
 dist/
-.tmp/
-.agent/
-.claude/
-.cli/
-.emmylua/
-.project/
-engine-docs/
-examples/
-templates/
-urhox-libs/
-lua-tools/
-schemas/
-logs/
-game_material/
-*.meta

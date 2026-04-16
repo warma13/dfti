@@ -89,6 +89,11 @@ function Server.Start()
     SubscribeToEvent(EVENTS.TEST_COMPLETED, "HandleTestCompleted")
     SubscribeToEvent(EVENTS.REQUEST_HISTORY, "HandleRequestHistory")
     SubscribeToEvent(EVENTS.REQUEST_ALL_RESULTS, "HandleRequestAllResults")
+    SubscribeToEvent(EVENTS.UPLOAD_QUESTION, "HandleUploadQuestion")
+    SubscribeToEvent(EVENTS.REQUEST_USER_QUESTIONS, "HandleRequestUserQuestions")
+    SubscribeToEvent(EVENTS.REQUEST_ALL_QUESTIONS, "HandleRequestAllQuestions")
+    SubscribeToEvent(EVENTS.SUBMIT_FEEDBACK, "HandleSubmitFeedback")
+    SubscribeToEvent(EVENTS.REQUEST_ALL_FEEDBACKS, "HandleRequestAllFeedbacks")
     SubscribeToEvent("ClientDisconnected", "HandleClientDisconnected")
 
     print("[Server] DFTI Server started")
@@ -458,6 +463,176 @@ function HandleRequestAllResults(eventType, eventData)
     print("[Server] Sent all result stats, total=" .. (resultStats_.total or 0))
 end
 
+-- ============================================================================
+-- 用户上传题目
+-- ============================================================================
+
+--- 最大题目数量（每用户）
+local MAX_USER_QUESTIONS = 50
+
+function HandleUploadQuestion(eventType, eventData)
+    local connection = eventData["Connection"]:GetPtr("Connection")
+    local connKey = tostring(connection)
+    local userId = connectionUserIds_[connKey]
+    if not userId then return end
+
+    local dataJson = eventData["Data"]:GetString()
+    local ok, data = pcall(cjson.decode, dataJson)
+    if not ok or not data then
+        print("[Server] UploadQuestion: invalid data from userId=" .. tostring(userId))
+        local respData = VariantMap()
+        respData["Data"] = Variant(cjson.encode({ success = false, reason = "数据格式错误" }))
+        connection:SendRemoteEvent(EVENTS.UPLOAD_QUESTION_RESP, true, respData)
+        return
+    end
+
+    local question = data.question or ""
+    local options = data.options or {}
+
+    if question == "" or #options < 2 then
+        local respData = VariantMap()
+        respData["Data"] = Variant(cjson.encode({ success = false, reason = "题目或选项不完整" }))
+        connection:SendRemoteEvent(EVENTS.UPLOAD_QUESTION_RESP, true, respData)
+        return
+    end
+
+    print(string.format("[Server] UploadQuestion userId=%s question=%s options=%d",
+        tostring(userId), question, #options))
+
+    if serverCloud == nil then
+        local respData = VariantMap()
+        respData["Data"] = Variant(cjson.encode({ success = false, reason = "服务端存储不可用" }))
+        connection:SendRemoteEvent(EVENTS.UPLOAD_QUESTION_RESP, true, respData)
+        return
+    end
+
+    -- 读取该用户已有的题目列表
+    serverCloud:Get(userId, Keys.USER_QUESTIONS, {
+        ok = function(scores, iscores)
+            local questions = {}
+            if scores and scores[Keys.USER_QUESTIONS] then
+                local ok2, parsed = pcall(cjson.decode, scores[Keys.USER_QUESTIONS])
+                if ok2 and type(parsed) == "table" then
+                    questions = parsed
+                end
+            end
+
+            if #questions >= MAX_USER_QUESTIONS then
+                local respData = VariantMap()
+                respData["Data"] = Variant(cjson.encode({ success = false, reason = "题目数量已达上限(" .. MAX_USER_QUESTIONS .. ")" }))
+                connection:SendRemoteEvent(EVENTS.UPLOAD_QUESTION_RESP, true, respData)
+                return
+            end
+
+            -- 追加新题目
+            table.insert(questions, {
+                question = question,
+                options = options,
+                timestamp = os.time(),
+            })
+
+            -- 构建带用户信息的题目条目（用于全局列表）
+            local newEntry = {
+                question = question,
+                options = options,
+                timestamp = os.time(),
+                userId = userId,
+            }
+
+            -- 写回用户自己的题目列表
+            serverCloud:Set(userId, Keys.USER_QUESTIONS, cjson.encode(questions), {
+                ok = function()
+                    print("[Server] Saved question for userId=" .. tostring(userId) .. " count=" .. #questions)
+                    local respData = VariantMap()
+                    respData["Data"] = Variant(cjson.encode({ success = true, count = #questions }))
+                    connection:SendRemoteEvent(EVENTS.UPLOAD_QUESTION_RESP, true, respData)
+
+                    -- 同步写入全局题目列表（ALL_QUESTIONS under SYSTEM_UID）
+                    AppendToGlobalQuestions(newEntry)
+                end,
+                error = function(code, reason)
+                    print("[Server] SaveQuestion ERROR: " .. tostring(code) .. " " .. tostring(reason))
+                    local respData = VariantMap()
+                    respData["Data"] = Variant(cjson.encode({ success = false, reason = "存储失败" }))
+                    connection:SendRemoteEvent(EVENTS.UPLOAD_QUESTION_RESP, true, respData)
+                end,
+            })
+        end,
+        error = function(code, reason)
+            -- 读取失败，当作首次上传
+            local questions = { {
+                question = question,
+                options = options,
+                timestamp = os.time(),
+            } }
+            local newEntry = {
+                question = question,
+                options = options,
+                timestamp = os.time(),
+                userId = userId,
+            }
+            serverCloud:Set(userId, Keys.USER_QUESTIONS, cjson.encode(questions), {
+                ok = function()
+                    print("[Server] Created first question for userId=" .. tostring(userId))
+                    local respData = VariantMap()
+                    respData["Data"] = Variant(cjson.encode({ success = true, count = 1 }))
+                    connection:SendRemoteEvent(EVENTS.UPLOAD_QUESTION_RESP, true, respData)
+                    AppendToGlobalQuestions(newEntry)
+                end,
+                error = function(code2, reason2)
+                    print("[Server] CreateQuestion ERROR: " .. tostring(code2) .. " " .. tostring(reason2))
+                    local respData = VariantMap()
+                    respData["Data"] = Variant(cjson.encode({ success = false, reason = "存储失败" }))
+                    connection:SendRemoteEvent(EVENTS.UPLOAD_QUESTION_RESP, true, respData)
+                end,
+            })
+        end,
+    })
+end
+
+function HandleRequestUserQuestions(eventType, eventData)
+    local connection = eventData["Connection"]:GetPtr("Connection")
+    local connKey = tostring(connection)
+    local userId = connectionUserIds_[connKey]
+    if not userId then return end
+
+    print("[Server] RequestUserQuestions from userId=" .. tostring(userId))
+
+    if serverCloud == nil then
+        local respData = VariantMap()
+        respData["Data"] = Variant(cjson.encode({ questions = {} }))
+        connection:SendRemoteEvent(EVENTS.USER_QUESTIONS_RESP, true, respData)
+        return
+    end
+
+    serverCloud:Get(userId, Keys.USER_QUESTIONS, {
+        ok = function(scores, iscores)
+            local questions = {}
+            if scores and scores[Keys.USER_QUESTIONS] then
+                local ok2, parsed = pcall(cjson.decode, scores[Keys.USER_QUESTIONS])
+                if ok2 and type(parsed) == "table" then
+                    questions = parsed
+                end
+            end
+
+            local respData = VariantMap()
+            respData["Data"] = Variant(cjson.encode({ questions = questions }))
+            connection:SendRemoteEvent(EVENTS.USER_QUESTIONS_RESP, true, respData)
+            print("[Server] Sent questions to userId=" .. tostring(userId) .. " count=" .. #questions)
+        end,
+        error = function(code, reason)
+            print("[Server] GetQuestions ERROR: " .. tostring(code) .. " " .. tostring(reason))
+            local respData = VariantMap()
+            respData["Data"] = Variant(cjson.encode({ questions = {} }))
+            connection:SendRemoteEvent(EVENTS.USER_QUESTIONS_RESP, true, respData)
+        end,
+    })
+end
+
+-- ============================================================================
+-- 玩家测试历史
+-- ============================================================================
+
 --- 保存玩家测试历史（最近 10 次）
 function SavePlayerHistory(userId, testData)
     if serverCloud == nil then return end
@@ -512,6 +687,254 @@ function SavePlayerHistory(userId, testData)
                     print("[Server] CreateHistory ERROR: " .. tostring(code2) .. " " .. tostring(reason2))
                 end,
             })
+        end,
+    })
+end
+
+-- ============================================================================
+-- 全局题目列表（管理员查看所有用户上传的题目）
+-- ============================================================================
+
+--- 最大全局题目数
+local MAX_GLOBAL_QUESTIONS = 500
+
+--- 将一条题目追加到全局题目列表（SYSTEM_UID 下的 ALL_QUESTIONS）
+function AppendToGlobalQuestions(entry)
+    if serverCloud == nil then return end
+
+    serverCloud:Get(SYSTEM_UID, Keys.ALL_QUESTIONS, {
+        ok = function(scores, iscores)
+            local allQuestions = {}
+            if scores and scores[Keys.ALL_QUESTIONS] then
+                local ok2, parsed = pcall(cjson.decode, scores[Keys.ALL_QUESTIONS])
+                if ok2 and type(parsed) == "table" then
+                    allQuestions = parsed
+                end
+            end
+
+            -- 超过上限则移除最早的
+            while #allQuestions >= MAX_GLOBAL_QUESTIONS do
+                table.remove(allQuestions, 1)
+            end
+
+            table.insert(allQuestions, entry)
+
+            serverCloud:Set(SYSTEM_UID, Keys.ALL_QUESTIONS, cjson.encode(allQuestions), {
+                ok = function()
+                    print("[Server] Global questions updated, total=" .. #allQuestions)
+                end,
+                error = function(code, reason)
+                    print("[Server] AppendGlobalQuestions SET ERROR: " .. tostring(code) .. " " .. tostring(reason))
+                end,
+            })
+        end,
+        error = function(code, reason)
+            -- 读取失败，创建新列表
+            local allQuestions = { entry }
+            serverCloud:Set(SYSTEM_UID, Keys.ALL_QUESTIONS, cjson.encode(allQuestions), {
+                ok = function()
+                    print("[Server] Created global questions list")
+                end,
+                error = function(code2, reason2)
+                    print("[Server] CreateGlobalQuestions ERROR: " .. tostring(code2) .. " " .. tostring(reason2))
+                end,
+            })
+        end,
+    })
+end
+
+--- 管理员请求查看所有用户的题目
+function HandleRequestAllQuestions(eventType, eventData)
+    local connection = eventData["Connection"]:GetPtr("Connection")
+    local connKey = tostring(connection)
+    local userId = connectionUserIds_[connKey]
+    if not userId then return end
+
+    -- 权限校验：仅管理员可查看
+    if not Settings.ADMIN_UIDS[userId] then
+        print("[Server] RequestAllQuestions DENIED for userId=" .. tostring(userId))
+        local respData = VariantMap()
+        respData["Data"] = Variant(cjson.encode({ questions = {}, denied = true }))
+        connection:SendRemoteEvent(EVENTS.ALL_QUESTIONS_RESP, true, respData)
+        return
+    end
+
+    print("[Server] RequestAllQuestions from admin userId=" .. tostring(userId))
+
+    if serverCloud == nil then
+        local respData = VariantMap()
+        respData["Data"] = Variant(cjson.encode({ questions = {} }))
+        connection:SendRemoteEvent(EVENTS.ALL_QUESTIONS_RESP, true, respData)
+        return
+    end
+
+    serverCloud:Get(SYSTEM_UID, Keys.ALL_QUESTIONS, {
+        ok = function(scores, iscores)
+            local allQuestions = {}
+            if scores and scores[Keys.ALL_QUESTIONS] then
+                local ok2, parsed = pcall(cjson.decode, scores[Keys.ALL_QUESTIONS])
+                if ok2 and type(parsed) == "table" then
+                    allQuestions = parsed
+                end
+            end
+
+            local respData = VariantMap()
+            respData["Data"] = Variant(cjson.encode({ questions = allQuestions }))
+            connection:SendRemoteEvent(EVENTS.ALL_QUESTIONS_RESP, true, respData)
+            print("[Server] Sent all questions to admin, count=" .. #allQuestions)
+        end,
+        error = function(code, reason)
+            print("[Server] GetAllQuestions ERROR: " .. tostring(code) .. " " .. tostring(reason))
+            local respData = VariantMap()
+            respData["Data"] = Variant(cjson.encode({ questions = {} }))
+            connection:SendRemoteEvent(EVENTS.ALL_QUESTIONS_RESP, true, respData)
+        end,
+    })
+end
+
+-- ============================================================================
+-- 用户反馈
+-- ============================================================================
+
+local MAX_FEEDBACKS = 200
+
+function HandleSubmitFeedback(eventType, eventData)
+    local connection = eventData["Connection"]:GetPtr("Connection")
+    local connKey = tostring(connection)
+    local userId = connectionUserIds_[connKey]
+    if not userId then return end
+
+    local dataJson = eventData["Data"]:GetString()
+    local ok, data = pcall(cjson.decode, dataJson)
+    if not ok or not data then
+        local respData = VariantMap()
+        respData["Data"] = Variant(cjson.encode({ success = false, reason = "数据格式错误" }))
+        connection:SendRemoteEvent(EVENTS.SUBMIT_FEEDBACK_RESP, true, respData)
+        return
+    end
+
+    local feedback = data.feedback or ""
+    if feedback == "" or #feedback < 2 then
+        local respData = VariantMap()
+        respData["Data"] = Variant(cjson.encode({ success = false, reason = "反馈内容太短" }))
+        connection:SendRemoteEvent(EVENTS.SUBMIT_FEEDBACK_RESP, true, respData)
+        return
+    end
+
+    print("[Server] SubmitFeedback userId=" .. tostring(userId) .. " len=" .. #feedback)
+
+    if serverCloud == nil then
+        local respData = VariantMap()
+        respData["Data"] = Variant(cjson.encode({ success = false, reason = "服务端存储不可用" }))
+        connection:SendRemoteEvent(EVENTS.SUBMIT_FEEDBACK_RESP, true, respData)
+        return
+    end
+
+    -- 追加到全局反馈列表
+    serverCloud:Get(SYSTEM_UID, Keys.ALL_FEEDBACKS, {
+        ok = function(scores, iscores)
+            local feedbacks = {}
+            if scores and scores[Keys.ALL_FEEDBACKS] then
+                local ok2, parsed = pcall(cjson.decode, scores[Keys.ALL_FEEDBACKS])
+                if ok2 and type(parsed) == "table" then
+                    feedbacks = parsed
+                end
+            end
+
+            while #feedbacks >= MAX_FEEDBACKS do
+                table.remove(feedbacks, 1)
+            end
+
+            table.insert(feedbacks, {
+                feedback = feedback,
+                userId = userId,
+                timestamp = os.time(),
+            })
+
+            serverCloud:Set(SYSTEM_UID, Keys.ALL_FEEDBACKS, cjson.encode(feedbacks), {
+                ok = function()
+                    print("[Server] Feedback saved, total=" .. #feedbacks)
+                    local respData = VariantMap()
+                    respData["Data"] = Variant(cjson.encode({ success = true }))
+                    connection:SendRemoteEvent(EVENTS.SUBMIT_FEEDBACK_RESP, true, respData)
+                end,
+                error = function(code, reason)
+                    print("[Server] SaveFeedback ERROR: " .. tostring(code) .. " " .. tostring(reason))
+                    local respData = VariantMap()
+                    respData["Data"] = Variant(cjson.encode({ success = false, reason = "存储失败" }))
+                    connection:SendRemoteEvent(EVENTS.SUBMIT_FEEDBACK_RESP, true, respData)
+                end,
+            })
+        end,
+        error = function(code, reason)
+            -- 首次创建
+            local feedbacks = { {
+                feedback = feedback,
+                userId = userId,
+                timestamp = os.time(),
+            } }
+            serverCloud:Set(SYSTEM_UID, Keys.ALL_FEEDBACKS, cjson.encode(feedbacks), {
+                ok = function()
+                    print("[Server] Created feedback list")
+                    local respData = VariantMap()
+                    respData["Data"] = Variant(cjson.encode({ success = true }))
+                    connection:SendRemoteEvent(EVENTS.SUBMIT_FEEDBACK_RESP, true, respData)
+                end,
+                error = function(code2, reason2)
+                    print("[Server] CreateFeedback ERROR: " .. tostring(code2) .. " " .. tostring(reason2))
+                    local respData = VariantMap()
+                    respData["Data"] = Variant(cjson.encode({ success = false, reason = "存储失败" }))
+                    connection:SendRemoteEvent(EVENTS.SUBMIT_FEEDBACK_RESP, true, respData)
+                end,
+            })
+        end,
+    })
+end
+
+--- 管理员请求查看所有反馈
+function HandleRequestAllFeedbacks(eventType, eventData)
+    local connection = eventData["Connection"]:GetPtr("Connection")
+    local connKey = tostring(connection)
+    local userId = connectionUserIds_[connKey]
+    if not userId then return end
+
+    if not Settings.ADMIN_UIDS[userId] then
+        print("[Server] RequestAllFeedbacks DENIED for userId=" .. tostring(userId))
+        local respData = VariantMap()
+        respData["Data"] = Variant(cjson.encode({ feedbacks = {}, denied = true }))
+        connection:SendRemoteEvent(EVENTS.ALL_FEEDBACKS_RESP, true, respData)
+        return
+    end
+
+    print("[Server] RequestAllFeedbacks from admin userId=" .. tostring(userId))
+
+    if serverCloud == nil then
+        local respData = VariantMap()
+        respData["Data"] = Variant(cjson.encode({ feedbacks = {} }))
+        connection:SendRemoteEvent(EVENTS.ALL_FEEDBACKS_RESP, true, respData)
+        return
+    end
+
+    serverCloud:Get(SYSTEM_UID, Keys.ALL_FEEDBACKS, {
+        ok = function(scores, iscores)
+            local feedbacks = {}
+            if scores and scores[Keys.ALL_FEEDBACKS] then
+                local ok2, parsed = pcall(cjson.decode, scores[Keys.ALL_FEEDBACKS])
+                if ok2 and type(parsed) == "table" then
+                    feedbacks = parsed
+                end
+            end
+
+            local respData = VariantMap()
+            respData["Data"] = Variant(cjson.encode({ feedbacks = feedbacks }))
+            connection:SendRemoteEvent(EVENTS.ALL_FEEDBACKS_RESP, true, respData)
+            print("[Server] Sent all feedbacks to admin, count=" .. #feedbacks)
+        end,
+        error = function(code, reason)
+            print("[Server] GetAllFeedbacks ERROR: " .. tostring(code) .. " " .. tostring(reason))
+            local respData = VariantMap()
+            respData["Data"] = Variant(cjson.encode({ feedbacks = {} }))
+            connection:SendRemoteEvent(EVENTS.ALL_FEEDBACKS_RESP, true, respData)
         end,
     })
 end
